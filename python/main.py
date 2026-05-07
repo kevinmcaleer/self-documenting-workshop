@@ -25,7 +25,8 @@ from pathlib import Path
 
 import cv2
 from anthropic import Anthropic
-from arduino.app_utils import Bridge, CloudASR, WebUI
+from arduino.app_utils import Bridge, WebUI
+from arduino.app_bricks.asr import AutomaticSpeechRecognition
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -50,7 +51,7 @@ client = Anthropic()
 # Bricks — initialised by App Lab runtime
 # ---------------------------------------------------------------------------
 
-asr = CloudASR()
+asr = AutomaticSpeechRecognition(language="en")
 bridge = Bridge()
 webui = WebUI(assets_dir_path="/app/assets")
 
@@ -202,14 +203,25 @@ async def timelapse_loop(sess: Session) -> None:
 
 
 async def transcript_loop(sess: Session) -> None:
-    async for chunk in asr.stream():
-        if chunk.text.strip():
-            sess.transcript.append(chunk.text)
-            sess.log_event("narration", chunk.text)
-            webui.send_message("transcript", {
-                "text": chunk.text,
-                "time": datetime.now().strftime("%H:%M:%S"),
-            })
+    loop = asyncio.get_event_loop()
+    q: asyncio.Queue[str] = asyncio.Queue()
+
+    def _run_asr():
+        with asr.transcribe_stream(duration=0) as stream:
+            for event in stream:
+                if event.type == "full_text" and event.data.strip():
+                    loop.call_soon_threadsafe(q.put_nowait, event.data.strip())
+
+    asyncio.ensure_future(loop.run_in_executor(None, _run_asr))
+
+    while True:
+        text = await q.get()
+        sess.transcript.append(text)
+        sess.log_event("narration", text)
+        webui.send_message("transcript", {
+            "text": text,
+            "time": datetime.now().strftime("%H:%M:%S"),
+        })
 
 
 async def mcu_event_loop(sess: Session) -> None:
@@ -305,6 +317,7 @@ async def start_session():
 
     session = Session()
     detector = FrameChangeDetector()
+    asr.start()
     log.info("session started — session_dir=%s", session.session_dir)
     bridge.call("set_status", {"state": "watching"})
 
@@ -325,6 +338,7 @@ async def end_session():
     for t in session_tasks:
         t.cancel()
     session_tasks = []
+    asr.stop()
 
     bridge.call("set_status", {"state": "thinking"})
     webui.send_message("status", {"state": "thinking", "duration": 0, "events": 0})

@@ -1,0 +1,5 @@
+fqbn: arduino:mbed:uno_q_mcu
+platform: arduino:mbed
+libraries:
+  - Arduino_LED_Matrix
+  - ArduinoRPC
