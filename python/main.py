@@ -277,14 +277,66 @@ def _strip_json_fence(text: str) -> str:
 
 CLASSIFICATION_PROMPT = """You watched a maker's workshop session. Below is the full event log and transcript of what was said.
 
-Decide which deliverable best fits this session. Choose ONE:
-  - "tutorial": linear progression, clear narration, suitable as a teaching post
-  - "build_log": iterative work with debugging, suitable as a development diary
-  - "video_script": strong narrative arc with a finished artefact, suitable for a YouTube video
+Produce TWO deliverables in one response.
 
-Then produce that deliverable. For tutorial: clean blog post with steps. For build_log: chronological notes with decisions and lessons. For video_script: md2script format with scene headings and dialogue.
+== Deliverable 1: chosen-kind deliverable ==
 
-Respond with JSON: {"choice": "<one of the above>", "reasoning": "<one sentence>", "output": "<the full deliverable in markdown>"}"""
+Pick the single best fit for this session:
+  - "tutorial":     linear progression, clear narration, suitable as a teaching post
+  - "build_log":    iterative work with debugging, suitable as a development diary
+  - "video_script": strong narrative arc with a finished artefact, for a YouTube video
+
+For tutorial: clean blog post with steps. For build_log: chronological notes with decisions and lessons. For video_script: md2script format with scene headings and dialogue.
+
+== Deliverable 2: blog post (always produced) ==
+
+A self-contained markdown blog post structured exactly as:
+
+  # <Title>            — derive from the project; use a name from the transcript if one is mentioned
+
+  <one or two short intro paragraphs setting the scene>
+
+  ## Bill of Materials
+
+  - <component>
+  - <component>
+  ...
+
+  ## Build Steps
+
+  ### Step 1: <short description>
+
+  ![](analysis_<timestamp>.jpg)
+
+  <one short paragraph about what was happening at this step>
+
+  ### Step 2: ...
+
+  ## Wrap-up
+
+  <one short closing paragraph>
+
+Image rules for the blog:
+  - Use markdown image syntax with the BASENAME only: ![](analysis_1234.jpg) — no path prefix.
+  - Pick image filenames from the events log. Use the frame_path field. Events with kind in (key_moment, notable, activity) tend to be the richest — prefer those.
+  - Use 4-8 images total, in chronological order. Don't repeat the same image.
+  - If no images are available, omit each step's image line rather than fabricating a filename.
+
+For the bill of materials:
+  - Aggregate unique items from events with kind=="component", plus any tools or parts mentioned in the transcript.
+  - List each item once. Don't invent components that aren't in the source material.
+
+Output rules:
+  - Respond with raw JSON. Do NOT wrap in markdown code fences (no ```json, no ```).
+  - Do not include any prose before or after the JSON object.
+
+Schema:
+{
+  "choice":    "<one of: tutorial, build_log, video_script>",
+  "reasoning": "<one sentence on why the chosen kind fits>",
+  "output":    "<the chosen deliverable in markdown>",
+  "blog":      "<the blog post in markdown, always present>"
+}"""
 
 
 # ---------------------------------------------------------------------------
@@ -846,8 +898,9 @@ class Scribe:
                 f"← {dt_ms}ms  choice={result['choice']!r}  "
                 f"reason: {result.get('reasoning', '?')}"
             )
-            path = self._write_deliverable(sess, result)
-            self._console("info", "deliverable", f"wrote {path}")
+            paths = self._write_deliverable(sess, result)
+            for path in paths:
+                self._console("info", "deliverable", f"wrote {path}")
         except Exception as e:
             self._console("error", "classify", f"failed: {e}")
         finally:
@@ -861,23 +914,48 @@ class Scribe:
             self._wrapping_up = False
 
     def _classify_and_generate(self, sess: Session) -> dict:
+        # Normalize frame paths to basenames in the digest. The blog uses
+        # relative image references so the markdown works when the session
+        # is downloaded as a zip and opened from a different machine.
+        events: list[dict] = []
+        for e in sess.events:
+            d = asdict(e)
+            if d.get("frame_path"):
+                d["frame_path"] = Path(d["frame_path"]).name
+            events.append(d)
+
         digest = {
             "duration_minutes": int((time.time() - sess.started_at) / 60),
-            "events": [asdict(e) for e in sess.events],
+            "events": events,
             "transcript": " ".join(n.text for n in sess.transcript),
             "key_moment_frames": [
-                e.frame_path for e in sess.events if e.kind == "key_moment"
+                Path(e.frame_path).name
+                for e in sess.events
+                if e.kind == "key_moment" and e.frame_path
             ],
         }
         resp = client.messages.create(
             model=DECISION_MODEL,
-            max_tokens=4000,
+            # 8000 leaves headroom for both the chosen deliverable AND the
+            # blog (which adds ~1500 tokens of structured markdown).
+            max_tokens=8000,
             messages=[{
                 "role": "user",
                 "content": CLASSIFICATION_PROMPT + "\n\n" + json.dumps(digest, indent=2),
             }],
         )
-        return json.loads(resp.content[0].text)
+        raw_text = resp.content[0].text if resp.content else ""
+        try:
+            return json.loads(_strip_json_fence(raw_text))
+        except (json.JSONDecodeError, IndexError) as e:
+            # Surface the failure clearly so we can see *what* the model
+            # returned. Without this, debugging escaping issues in the
+            # JSON string fields was painful.
+            self._console(
+                "warning", "classify",
+                f"could not parse Opus JSON: {e}; head={raw_text[:200]!r}"
+            )
+            raise
 
     def _write_transcript(self, sess: Session) -> Path | None:
         """Save a human-readable transcript.txt next to the deliverable.
@@ -903,13 +981,27 @@ class Scribe:
         out.write_text("\n".join(lines) + "\n")
         return out
 
-    def _write_deliverable(self, sess: Session, result: dict) -> Path:
+    def _write_deliverable(self, sess: Session, result: dict) -> list[Path]:
+        """Write both the chosen deliverable (build_log/tutorial/video_script)
+        and the always-on structured blog post into the session directory.
+        Returns the list of file paths written so the finalize log line
+        can report all of them."""
+        written: list[Path] = []
+
         out = sess.session_dir / f"{result['choice']}.md"
         out.write_text(result["output"])
         log.info(
             f"wrote {out} — choice was '{result['choice']}' because: {result['reasoning']}"
         )
-        return out
+        written.append(out)
+
+        blog = result.get("blog")
+        if blog:
+            blog_path = sess.session_dir / "blog.md"
+            blog_path.write_text(blog)
+            written.append(blog_path)
+
+        return written
 
     # MCU event handlers (invoked from the Bridge read thread) --------------
 
@@ -1048,6 +1140,8 @@ class Scribe:
             "file_count": len(files),
             "size_bytes": sum(f.stat().st_size for f in files),
             "deliverable": deliverable,
+            "has_blog": (d / "blog.md").exists(),
+            "has_transcript": (d / "transcript.txt").exists(),
             "is_active": (
                 self.session is not None
                 and self.session.session_dir.name == d.name

@@ -254,6 +254,7 @@
   .session-meta { color: #71717a; }
   .session-meta .deliverable { color: #7dd3fc; font-weight: 600; }
   .session-meta .deliverable.none { color: #71717a; font-weight: 400; font-style: italic; }
+  .session-meta .extras { color: #4ade80; font-weight: 500; }
   .session-actions { display: flex; gap: 0.4rem; margin-top: auto; padding-top: 0.4rem; }
   .btn-download, .btn-delete {
     padding: 0.25rem 0.6rem; border-radius: 5px;
@@ -537,7 +538,12 @@ async function refreshSessions() {
       : (s.is_active
           ? '<span class="deliverable none">recording…</span>'
           : '<span class="deliverable none">no deliverable</span>');
-    meta.innerHTML = `${delivKind} · ${s.file_count} files · ${formatSize(s.size_bytes)}`;
+    // Trailing chips: + blog / + transcript indicators
+    const extras = [];
+    if (s.has_blog)       extras.push('+ blog');
+    if (s.has_transcript) extras.push('+ transcript');
+    const extrasStr = extras.length ? ' <span class="extras">' + extras.join(' ') + '</span>' : '';
+    meta.innerHTML = `${delivKind}${extrasStr} · ${s.file_count} files · ${formatSize(s.size_bytes)}`;
 
     const actions = document.createElement('div');
     actions.className = 'session-actions';
