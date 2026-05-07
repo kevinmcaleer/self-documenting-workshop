@@ -1,6 +1,8 @@
 name: Self-Documenting Workshop
-description: ""
+description: "Passive observer agent that watches a maker's bench and produces build artefacts"
+icon: "\U0001F4F7"
 ports: []
 bricks:
-- arduino:cloud_llm: {}
-icon: 📷
+  - arduino:cloud_asr: {}
+  - arduino:webui_html:
+      assets_dir_path: /app/assets

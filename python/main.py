@@ -18,28 +18,25 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 
-import cv2  # for the local "did anything change" gate
+import cv2
 from anthropic import Anthropic
-
-# --- App Lab Bricks (imported by the App Lab runtime; stubbed for clarity) ---
-# In a real App Lab project these come from the Bricks system.
-from bricks import camera, asr_cloud, bridge   # noqa: F401
+from arduino.app_utils import Bridge, CloudASR, WebUI
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 SESSION_DIR = Path.home() / "workshop_scribe" / "sessions"
-FRAME_INTERVAL_S = 30          # how often to *consider* a frame
-MIN_PIXEL_DELTA = 0.04         # skip frame if <4% changed since last analysed
-TIMELAPSE_INTERVAL_S = 10      # frames captured for timelapse (no analysis)
-IDLE_TIMEOUT_S = 15 * 60       # session ends after this much silence + stillness
+FRAME_INTERVAL_S = 30
+MIN_PIXEL_DELTA = 0.04
+TIMELAPSE_INTERVAL_S = 10
+IDLE_TIMEOUT_S = 15 * 60
+WEB_FRAME_INTERVAL_S = 0.5
 
 ANALYSIS_MODEL = "claude-sonnet-4-6"
 DECISION_MODEL = "claude-opus-4-7"
@@ -47,7 +44,23 @@ DECISION_MODEL = "claude-opus-4-7"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 log = logging.getLogger("scribe")
 
-client = Anthropic()  # reads ANTHROPIC_API_KEY from env
+client = Anthropic()
+
+# ---------------------------------------------------------------------------
+# Bricks — initialised by App Lab runtime
+# ---------------------------------------------------------------------------
+
+asr = CloudASR()
+bridge = Bridge()
+webui = WebUI(assets_dir_path="/app/assets")
+
+# Camera via OpenCV — no Camera brick exists; we grab frames directly.
+cap = cv2.VideoCapture(0)
+
+
+def capture_frame() -> cv2.Mat | None:
+    ok, frame = cap.read()
+    return frame if ok else None
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +70,7 @@ client = Anthropic()  # reads ANTHROPIC_API_KEY from env
 @dataclass
 class Event:
     timestamp: float
-    kind: str           # "activity" | "component" | "narration" | "marker"
+    kind: str
     detail: str
     frame_path: str | None = None
 
@@ -79,8 +92,16 @@ class Session:
         ev = Event(time.time(), kind, detail, frame_path)
         self.events.append(ev)
         log.info("event[%s] %s", kind, detail)
-        # Pulse the LED matrix on the MCU side so it's visible on camera
         bridge.call("pulse_led", {"kind": kind})
+
+
+# ---------------------------------------------------------------------------
+# App state — tracks whether a session is active
+# ---------------------------------------------------------------------------
+
+session: Session | None = None
+detector: FrameChangeDetector | None = None
+session_tasks: list[asyncio.Task] = []
 
 
 # ---------------------------------------------------------------------------
@@ -88,8 +109,6 @@ class Session:
 # ---------------------------------------------------------------------------
 
 class FrameChangeDetector:
-    """Avoid sending near-identical frames to the API."""
-
     def __init__(self) -> None:
         self._prev: cv2.Mat | None = None
 
@@ -123,8 +142,7 @@ ANALYSIS_PROMPT = """You are observing a maker's workshop bench. Look at this fr
 Be terse. If nothing is happening, say activity is "idle" and notable is null."""
 
 
-async def analyse_frame(session: Session, frame_path: Path) -> None:
-    """Send one frame to Sonnet for structured analysis."""
+async def analyse_frame(sess: Session, frame_path: Path) -> None:
     img_b64 = base64.standard_b64encode(frame_path.read_bytes()).decode()
 
     resp = client.messages.create(
@@ -148,54 +166,87 @@ async def analyse_frame(session: Session, frame_path: Path) -> None:
         return
 
     if data.get("activity") and data["activity"] != "idle":
-        session.log_event("activity", data["activity"], str(frame_path))
+        sess.log_event("activity", data["activity"], str(frame_path))
     for comp in data.get("components_visible") or []:
-        session.log_event("component", comp, str(frame_path))
+        sess.log_event("component", comp, str(frame_path))
     if data.get("notable"):
-        session.log_event("notable", data["notable"], str(frame_path))
+        sess.log_event("notable", data["notable"], str(frame_path))
     if data.get("is_key_moment"):
-        session.log_event("key_moment", data.get("notable") or "milestone", str(frame_path))
+        sess.log_event("key_moment", data.get("notable") or "milestone", str(frame_path))
 
 
 # ---------------------------------------------------------------------------
-# Capture loops — one slow loop for analysis, one fast loop for timelapse
+# Capture loops
 # ---------------------------------------------------------------------------
 
-async def analysis_loop(session: Session, detector: FrameChangeDetector) -> None:
+async def analysis_loop(sess: Session, det: FrameChangeDetector) -> None:
     while True:
         await asyncio.sleep(FRAME_INTERVAL_S)
-        frame = camera.capture()  # via App Lab Camera Brick
-        if not detector.is_meaningfully_different(frame):
+        frame = capture_frame()
+        if frame is None or not det.is_meaningfully_different(frame):
             continue
-        path = session.session_dir / f"analysis_{int(time.time())}.jpg"
+        path = sess.session_dir / f"analysis_{int(time.time())}.jpg"
         cv2.imwrite(str(path), frame)
-        await analyse_frame(session, path)
+        await analyse_frame(sess, path)
 
 
-async def timelapse_loop(session: Session) -> None:
+async def timelapse_loop(sess: Session) -> None:
     while True:
         await asyncio.sleep(TIMELAPSE_INTERVAL_S)
-        frame = camera.capture()
-        path = session.session_dir / f"tl_{int(time.time())}.jpg"
+        frame = capture_frame()
+        if frame is None:
+            continue
+        path = sess.session_dir / f"tl_{int(time.time())}.jpg"
         cv2.imwrite(str(path), frame)
-        session.timelapse_frames.append(str(path))
+        sess.timelapse_frames.append(str(path))
 
 
-async def transcript_loop(session: Session) -> None:
-    """Stream from the ASR Cloud Brick. Ambient narration is cheap and rich signal."""
-    async for chunk in asr_cloud.stream():
+async def transcript_loop(sess: Session) -> None:
+    async for chunk in asr.stream():
         if chunk.text.strip():
-            session.transcript.append(chunk.text)
-            session.log_event("narration", chunk.text)
+            sess.transcript.append(chunk.text)
+            sess.log_event("narration", chunk.text)
+            webui.send_message("transcript", {
+                "text": chunk.text,
+                "time": datetime.now().strftime("%H:%M:%S"),
+            })
 
 
-async def mcu_event_loop(session: Session) -> None:
-    """Listen for MCU events: button-press markers, soldering iron on/off."""
+async def mcu_event_loop(sess: Session) -> None:
     async for ev in bridge.subscribe("mcu_events"):
         if ev["kind"] == "marker_pressed":
-            session.log_event("marker", "user marked this moment as important")
+            sess.log_event("marker", "user marked this moment as important")
         elif ev["kind"] == "iron_on":
-            session.log_event("activity", "soldering iron powered on")
+            sess.log_event("activity", "soldering iron powered on")
+        elif ev["kind"] == "session_end":
+            await end_session()
+
+
+async def web_frame_loop() -> None:
+    """Push camera frames to the dashboard at a comfortable preview rate."""
+    while True:
+        await asyncio.sleep(WEB_FRAME_INTERVAL_S)
+        frame = capture_frame()
+        if frame is None:
+            continue
+        _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+        webui.send_message("frame", {
+            "jpeg": base64.b64encode(jpeg.tobytes()).decode(),
+        })
+
+
+async def status_broadcast_loop() -> None:
+    """Push session status to the dashboard periodically."""
+    while True:
+        await asyncio.sleep(1)
+        if session is not None:
+            webui.send_message("status", {
+                "state": "recording",
+                "duration": int(time.time() - session.started_at),
+                "events": len(session.events),
+            })
+        else:
+            webui.send_message("status", {"state": "idle", "duration": 0, "events": 0})
 
 
 # ---------------------------------------------------------------------------
@@ -214,14 +265,13 @@ Then produce that deliverable. For tutorial: clean blog post with steps. For bui
 Respond with JSON: {"choice": "<one of the above>", "reasoning": "<one sentence>", "output": "<the full deliverable in markdown>"}"""
 
 
-async def classify_and_generate(session: Session) -> dict:
-    """End-of-session: Opus reads everything and decides what to produce."""
+async def classify_and_generate(sess: Session) -> dict:
     digest = {
-        "duration_minutes": int((time.time() - session.started_at) / 60),
-        "events": [asdict(e) for e in session.events],
-        "transcript": " ".join(session.transcript),
+        "duration_minutes": int((time.time() - sess.started_at) / 60),
+        "events": [asdict(e) for e in sess.events],
+        "transcript": " ".join(sess.transcript),
         "key_moment_frames": [
-            e.frame_path for e in session.events if e.kind == "key_moment"
+            e.frame_path for e in sess.events if e.kind == "key_moment"
         ],
     }
 
@@ -236,8 +286,8 @@ async def classify_and_generate(session: Session) -> dict:
     return json.loads(resp.content[0].text)
 
 
-def write_deliverable(session: Session, result: dict) -> Path:
-    out = session.session_dir / f"{result['choice']}.md"
+def write_deliverable(sess: Session, result: dict) -> Path:
+    out = sess.session_dir / f"{result['choice']}.md"
     out.write_text(result["output"])
     log.info("wrote %s — choice was '%s' because: %s",
              out, result["choice"], result["reasoning"])
@@ -245,37 +295,98 @@ def write_deliverable(session: Session, result: dict) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Session lifecycle (called from web dashboard and MCU button)
 # ---------------------------------------------------------------------------
 
-async def main() -> None:
+async def start_session():
+    global session, detector, session_tasks
+    if session is not None:
+        return
+
     session = Session()
     detector = FrameChangeDetector()
     log.info("session started — session_dir=%s", session.session_dir)
     bridge.call("set_status", {"state": "watching"})
 
-    tasks = [
+    session_tasks = [
         asyncio.create_task(analysis_loop(session, detector)),
         asyncio.create_task(timelapse_loop(session)),
         asyncio.create_task(transcript_loop(session)),
         asyncio.create_task(mcu_event_loop(session)),
     ]
 
+
+async def end_session():
+    global session, session_tasks
+    if session is None:
+        return
+
+    log.info("session ending — generating deliverable")
+    for t in session_tasks:
+        t.cancel()
+    session_tasks = []
+
+    bridge.call("set_status", {"state": "thinking"})
+    webui.send_message("status", {"state": "thinking", "duration": 0, "events": 0})
+
+    result = await classify_and_generate(session)
+    path = write_deliverable(session, result)
+
+    bridge.call("set_status", {"state": "done"})
+    webui.send_message("status", {"state": "done", "duration": 0, "events": 0})
+    log.info("deliverable: %s", path)
+
+    session = None
+
+
+# ---------------------------------------------------------------------------
+# Web API handlers (called by the WebUI brick)
+# ---------------------------------------------------------------------------
+
+async def api_start_session():
+    await start_session()
+    return {"status": "started"}
+
+
+async def api_stop_session():
+    await end_session()
+    return {"status": "stopping"}
+
+
+async def api_session_status():
+    if session is None:
+        return {"active": False, "duration": 0, "events": 0, "transcript_lines": 0}
+    return {
+        "active": True,
+        "duration": int(time.time() - session.started_at),
+        "events": len(session.events),
+        "transcript_lines": len(session.transcript),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+async def main() -> None:
+    webui.expose_api("POST", "/api/session/start", api_start_session)
+    webui.expose_api("POST", "/api/session/stop", api_stop_session)
+    webui.expose_api("GET", "/api/session/status", api_session_status)
+    webui.start()
+    log.info("dashboard at %s", webui.local_url)
+
+    background_tasks = [
+        asyncio.create_task(web_frame_loop()),
+        asyncio.create_task(status_broadcast_loop()),
+    ]
+
     try:
-        # In real use: detect end-of-session via idle timeout, button hold, or
-        # voice command "scribe, wrap up". Stubbed as run-until-cancelled.
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*background_tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        log.info("session ending — generating deliverable")
-        for t in tasks:
-            t.cancel()
-        bridge.call("set_status", {"state": "thinking"})
-        result = await classify_and_generate(session)
-        path = write_deliverable(session, result)
-        bridge.call("set_status", {"state": "done"})
-        log.info("deliverable: %s", path)
+        if session is not None:
+            await end_session()
+        webui.stop()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-

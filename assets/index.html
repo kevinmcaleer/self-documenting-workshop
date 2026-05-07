@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workshop Scribe</title>
+<script src="/socket.io/socket.io.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f1117; color: #e4e4e7;
+    display: flex; flex-direction: column; min-height: 100vh;
+  }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 1rem 1.5rem; background: #1a1b23; border-bottom: 1px solid #2a2b35;
+  }
+  header h1 { font-size: 1.25rem; font-weight: 600; }
+
+  .controls { display: flex; gap: 0.75rem; align-items: center; }
+  .controls button {
+    padding: 0.5rem 1.25rem; border: none; border-radius: 6px;
+    font-size: 0.875rem; font-weight: 600; cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #btn-start { background: #22c55e; color: #000; }
+  #btn-stop  { background: #ef4444; color: #fff; }
+
+  .pill {
+    padding: 0.3rem 0.75rem; border-radius: 999px; font-size: 0.75rem;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .pill-idle     { background: #27272a; color: #71717a; }
+  .pill-recording{ background: #14532d; color: #4ade80; }
+  .pill-thinking { background: #3b0764; color: #c084fc; }
+  .pill-done     { background: #1e3a5f; color: #7dd3fc; }
+
+  .stats {
+    display: flex; gap: 1.5rem; font-size: 0.8rem; color: #71717a;
+    font-variant-numeric: tabular-nums;
+  }
+  .stats span { white-space: nowrap; }
+
+  main {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 1rem; padding: 1rem 1.5rem; flex: 1;
+  }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+
+  .card {
+    background: #1a1b23; border: 1px solid #2a2b35; border-radius: 10px;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .card-header {
+    padding: 0.75rem 1rem; border-bottom: 1px solid #2a2b35;
+    font-size: 0.8rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.05em; color: #a1a1aa;
+  }
+  .card-body { flex: 1; position: relative; }
+
+  #camera-feed {
+    width: 100%; display: block; background: #000;
+    min-height: 240px; object-fit: contain;
+  }
+  .no-feed {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; color: #52525b; font-size: 0.875rem;
+  }
+
+  #transcript {
+    padding: 1rem; font-size: 0.875rem; line-height: 1.6;
+    max-height: 60vh; overflow-y: auto;
+  }
+  #transcript:empty::before {
+    content: "Transcription will appear here\2026";
+    color: #52525b;
+  }
+  .line {
+    padding: 0.25rem 0; border-bottom: 1px solid #1f2028;
+    animation: fadein 0.3s ease;
+  }
+  .line .ts {
+    color: #52525b; font-size: 0.75rem; margin-right: 0.5rem;
+    font-variant-numeric: tabular-nums;
+  }
+  @keyframes fadein {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  footer {
+    padding: 0.5rem 1.5rem; text-align: center; font-size: 0.7rem;
+    color: #3f3f46; border-top: 1px solid #1f2028;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Workshop Scribe</h1>
+  <div class="controls">
+    <span id="pill" class="pill pill-idle">Idle</span>
+    <div class="stats">
+      <span id="stat-duration">--:--</span>
+      <span id="stat-events">0 events</span>
+    </div>
+    <button id="btn-start" onclick="startSession()">Start Session</button>
+    <button id="btn-stop" onclick="stopSession()" disabled>Stop Session</button>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <div class="card-header">Camera</div>
+    <div class="card-body">
+      <div id="no-feed" class="no-feed">Waiting for camera&hellip;</div>
+      <img id="camera-feed" style="display:none" />
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">Transcription</div>
+    <div class="card-body">
+      <div id="transcript"></div>
+    </div>
+  </div>
+</main>
+
+<footer>Workshop Scribe &mdash; kevsrobots.com</footer>
+
+<script>
+const pill   = document.getElementById('pill');
+const btnOn  = document.getElementById('btn-start');
+const btnOff = document.getElementById('btn-stop');
+const txDiv  = document.getElementById('transcript');
+const camImg = document.getElementById('camera-feed');
+const noFeed = document.getElementById('no-feed');
+const statDuration = document.getElementById('stat-duration');
+const statEvents   = document.getElementById('stat-events');
+
+let active = false;
+
+const socket = io();
+
+socket.on('connect', () => console.log('socket connected'));
+
+// Live transcript lines from the server.
+socket.on('transcript', (data) => {
+  const line = document.createElement('div');
+  line.className = 'line';
+  const ts = document.createElement('span');
+  ts.className = 'ts';
+  ts.textContent = data.time || new Date().toLocaleTimeString();
+  line.appendChild(ts);
+  line.appendChild(document.createTextNode(data.text));
+  txDiv.appendChild(line);
+  txDiv.scrollTop = txDiv.scrollHeight;
+});
+
+// Camera frames as base64 JPEG, pushed from the server.
+socket.on('frame', (data) => {
+  camImg.src = 'data:image/jpeg;base64,' + data.jpeg;
+  camImg.style.display = 'block';
+  noFeed.style.display = 'none';
+});
+
+// Session status updates.
+socket.on('status', (data) => {
+  setStatus(data.state, data.duration, data.events);
+});
+
+function setStatus(state, duration, events) {
+  pill.className = 'pill pill-' + state;
+  pill.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+
+  active = (state === 'recording');
+  btnOn.disabled  = active || state === 'thinking';
+  btnOff.disabled = !active;
+
+  if (typeof duration === 'number') {
+    const m = Math.floor(duration / 60);
+    const s = duration % 60;
+    statDuration.textContent = String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+  }
+  if (typeof events === 'number') {
+    statEvents.textContent = events + ' event' + (events !== 1 ? 's' : '');
+  }
+}
+
+async function startSession() {
+  const r = await fetch('/api/session/start', { method: 'POST' });
+  const d = await r.json();
+  if (d.status === 'started') setStatus('recording', 0, 0);
+}
+
+async function stopSession() {
+  setStatus('thinking', null, null);
+  const r = await fetch('/api/session/stop', { method: 'POST' });
+  const d = await r.json();
+  if (d.status === 'stopping') setStatus('thinking', null, null);
+}
+</script>
+</body>
+</html>
