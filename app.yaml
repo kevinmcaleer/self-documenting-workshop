@@ -1,0 +1,6 @@
+name: Self-Documenting Workshop
+description: ""
+ports: []
+bricks:
+- arduino:cloud_llm: {}
+icon: 📷
