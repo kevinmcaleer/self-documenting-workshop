@@ -41,7 +41,7 @@ import numpy as np
 import requests
 import sounddevice as sd
 from anthropic import Anthropic
-from arduino.app_utils import App, Bridge, Logger, brick
+from arduino.app_utils import App, Bridge, Leds, Logger, brick
 from arduino.app_bricks.web_ui import WebUI
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
@@ -98,6 +98,16 @@ AUDIO_BLOCK_MS = 100  # callback cadence — gives a ~10 Hz mic level meter
 # to ±32k; quiet rooms sit ~50–200, real speech sits ~1000+. The live
 # value is per-bench tunable via the dashboard slider.
 AUDIO_RMS_THRESHOLD_DEFAULT = 250
+
+# Status enum mirrored from sketch.ino's `enum Status`. We pass the int
+# directly via Bridge.notify("set_status", N) — much more reliable than
+# stringly-typed status names which the sketch's `int s` parameter would
+# silently fail to decode.
+MCU_STATUS_IDLE     = 0
+MCU_STATUS_WATCHING = 1
+MCU_STATUS_NOTICED  = 2
+MCU_STATUS_THINKING = 3
+MCU_STATUS_DONE     = 4
 
 log = Logger("scribe")
 
@@ -505,6 +515,47 @@ class Scribe:
         )
         self.webui.send_message("console", entry)
 
+    # On-board RGB LEDs ----------------------------------------------------
+    #
+    # The Uno Q has four onboard RGB LEDs. LED1 + LED2 are MPU-controllable
+    # (sysfs brightness files driven by the App Lab Leds helper); LED3 +
+    # LED4 are MCU-controllable, driven by sketch.ino in response to
+    # Bridge.notify("set_status", N). LEDs are binary on/off — the
+    # purple "pulse" is a software toggle, not an analog fade.
+    _LED_PALETTE = {
+        "idle":      (False, False, True),    # blue   — ready to record
+        "recording": (True,  False, False),   # red    — session in progress
+        "thinking":  (True,  False, True),    # purple — Opus call in flight
+        "done":      (False, True,  False),   # green  — transient on completion
+        "off":       (False, False, False),
+    }
+
+    def _set_leds(self, state: str) -> None:
+        """Drive LED1 + LED2 to a named state. Quietly no-op if the sysfs
+        files aren't writable (running outside the container, missing
+        group permissions, etc.) — visible state is nice-to-have, not
+        essential for correctness."""
+        color = self._LED_PALETTE.get(state)
+        if color is None:
+            return
+        try:
+            Leds.set_led1_color(*color)
+            Leds.set_led2_color(*color)
+        except Exception as e:
+            log.debug(f"led write failed: {e}")
+
+    def _thinking_pulse(self) -> None:
+        """Toggle LED1 + LED2 between purple and off at 1 Hz while
+        self._wrapping_up is True, then settle back to idle blue when
+        the Opus call completes. Spawned as a daemon thread by
+        end_session()."""
+        on = True
+        while self._wrapping_up:
+            self._set_leds("thinking" if on else "off")
+            on = not on
+            time.sleep(0.5)
+        self._set_leds("idle")
+
     def _on_client_connect(self, sid: str) -> None:
         """Replay context for any newly-connected dashboard client so the
         UI doesn't appear blank on a refresh mid-session: console history
@@ -547,6 +598,13 @@ class Scribe:
             f"camera: {'ok' if self.cap is not None else 'missing'}, "
             f"api key: {'set' if os.environ.get('ANTHROPIC_API_KEY') else 'MISSING'}"
         )
+
+        # Initial LED state — blue says "ready to record".
+        self._set_leds("idle")
+        try:
+            Bridge.notify("set_status", MCU_STATUS_IDLE)
+        except Exception:
+            pass
 
     # Camera ----------------------------------------------------------------
 
@@ -847,8 +905,9 @@ class Scribe:
         self.session = Session()
         self.detector = FrameChangeDetector()
         self._console("info", "session", f"started — {self.session.session_dir}")
+        self._set_leds("recording")
         try:
-            Bridge.notify("set_status", "watching")
+            Bridge.notify("set_status", MCU_STATUS_WATCHING)
         except Exception:
             pass
 
@@ -864,9 +923,16 @@ class Scribe:
             f"{len(sess.timelapse_frames)} timelapse frames"
         )
         try:
-            Bridge.notify("set_status", "thinking")
+            Bridge.notify("set_status", MCU_STATUS_THINKING)
         except Exception:
             pass
+        # Spawn the purple-pulse worker. It loops while _wrapping_up is
+        # True and settles to idle blue when _finalize_session clears it.
+        threading.Thread(
+            target=self._thinking_pulse,
+            name="Scribe._thinking_pulse",
+            daemon=True,
+        ).start()
         self.webui.send_message("status", {"state": "thinking", "duration": 0, "events": 0})
 
         # Run the Opus call off-thread so the HTTP/RPC caller returns
@@ -905,12 +971,14 @@ class Scribe:
             self._console("error", "classify", f"failed: {e}")
         finally:
             try:
-                Bridge.notify("set_status", "done")
+                Bridge.notify("set_status", MCU_STATUS_DONE)
             except Exception:
                 pass
             self.webui.send_message("status", {"state": "done", "duration": 0, "events": 0})
             self.webui.send_message("sessions_changed", {})
             self.session = None
+            # Clearing the flag unblocks _thinking_pulse, which then
+            # transitions LED1+LED2 back to "idle" (blue).
             self._wrapping_up = False
 
     def _classify_and_generate(self, sess: Session) -> dict:

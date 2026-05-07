@@ -253,11 +253,37 @@ void renderDone() {
 
 void updateRgbForStatus() {
   switch (currentStatus) {
-    case STATUS_IDLE:     analogWrite(PIN_RGB_R, 0);   analogWrite(PIN_RGB_G, 0);   analogWrite(PIN_RGB_B, 10);  break;
-    case STATUS_WATCHING: analogWrite(PIN_RGB_R, 0);   analogWrite(PIN_RGB_G, 30);  analogWrite(PIN_RGB_B, 10);  break;
-    case STATUS_NOTICED:  analogWrite(PIN_RGB_R, 100); analogWrite(PIN_RGB_G, 80);  analogWrite(PIN_RGB_B, 0);   break;
-    case STATUS_THINKING: analogWrite(PIN_RGB_R, 80);  analogWrite(PIN_RGB_G, 0);   analogWrite(PIN_RGB_B, 80);  break;
-    case STATUS_DONE:     analogWrite(PIN_RGB_R, 0);   analogWrite(PIN_RGB_G, 120); analogWrite(PIN_RGB_B, 0);   break;
+    // Idle: solid blue. Bench is "ready to record".
+    case STATUS_IDLE:
+      analogWrite(PIN_RGB_R, 0);   analogWrite(PIN_RGB_G, 0);   analogWrite(PIN_RGB_B, 80);
+      break;
+
+    // Watching = recording in progress. Bright red, visible from across
+    // the bench so it's obvious a session is live.
+    case STATUS_WATCHING:
+      analogWrite(PIN_RGB_R, 200); analogWrite(PIN_RGB_G, 0);   analogWrite(PIN_RGB_B, 0);
+      break;
+
+    // Noticed: transient amber when something's just been logged.
+    case STATUS_NOTICED:
+      analogWrite(PIN_RGB_R, 180); analogWrite(PIN_RGB_G, 100); analogWrite(PIN_RGB_B, 0);
+      break;
+
+    // Thinking: purple pulse via a triangle wave on millis(). One full
+    // cycle per second matches the MPU-side LED1+LED2 toggle so all four
+    // LEDs breathe in sync during the Opus call.
+    case STATUS_THINKING: {
+      uint16_t pos = millis() % 1000;
+      uint8_t  tri = pos < 500 ? (uint8_t)(pos / 4) : (uint8_t)((1000 - pos) / 4);  // 0..125..0
+      analogWrite(PIN_RGB_R, tri);
+      analogWrite(PIN_RGB_G, 0);
+      analogWrite(PIN_RGB_B, tri);
+    } break;
+
+    // Done: brief green confirmation before falling back to idle.
+    case STATUS_DONE:
+      analogWrite(PIN_RGB_R, 0);   analogWrite(PIN_RGB_G, 150); analogWrite(PIN_RGB_B, 0);
+      break;
   }
 }
 
