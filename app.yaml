@@ -3,6 +3,5 @@ description: "Passive observer agent that watches a maker's bench and produces b
 icon: "\U0001F4F7"
 ports: []
 bricks:
-  - arduino:asr: {}
-  - arduino:webui_html:
+  - "arduino:web_ui":
       assets_dir_path: /app/assets

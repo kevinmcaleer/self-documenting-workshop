@@ -1,2 +1,5 @@
 anthropic>=0.45.0
 opencv-python-headless>=4.9.0
+sounddevice>=0.5.0
+requests>=2.31.0
+numpy>=1.26.0

@@ -1,5 +1,12 @@
-fqbn: arduino:mbed:uno_q_mcu
-platform: arduino:mbed
-libraries:
-  - Arduino_LED_Matrix
-  - ArduinoRPC
+default_profile: default
+profiles:
+  default:
+    fqbn: arduino:zephyr:unoq
+    platforms:
+      - platform: arduino:zephyr
+    libraries:
+      - Arduino_LED_Matrix
+      - MsgPack (0.4.2)
+      - DebugLog (0.8.4)
+      - ArxContainer (0.7.0)
+      - ArxTypeTraits (0.3.1)

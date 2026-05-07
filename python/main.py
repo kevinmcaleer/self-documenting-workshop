@@ -16,17 +16,22 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
+import os
 import time
+import wave
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 
 import cv2
+import requests
+import sounddevice as sd
 from anthropic import Anthropic
-from arduino.app_utils import Bridge, WebUI
-from arduino.app_bricks.asr import AutomaticSpeechRecognition
+from arduino.app_utils import Bridge
+from arduino.app_bricks.web_ui import WebUI
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -42,16 +47,19 @@ WEB_FRAME_INTERVAL_S = 0.5
 ANALYSIS_MODEL = "claude-sonnet-4-6"
 DECISION_MODEL = "claude-opus-4-7"
 
+WHISPER_URL = os.environ.get("WHISPER_URL", "http://192.168.1.100:8178")
+AUDIO_CHUNK_S = 10
+AUDIO_SAMPLE_RATE = 16000
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 log = logging.getLogger("scribe")
 
 client = Anthropic()
 
 # ---------------------------------------------------------------------------
-# Bricks — initialised by App Lab runtime
+# Bricks
 # ---------------------------------------------------------------------------
 
-asr = AutomaticSpeechRecognition(language="en")
 bridge = Bridge()
 webui = WebUI(assets_dir_path="/app/assets")
 
@@ -125,6 +133,44 @@ class FrameChangeDetector:
             self._prev = gray
             return True
         return False
+
+
+# ---------------------------------------------------------------------------
+# Audio recording + remote Whisper transcription
+# ---------------------------------------------------------------------------
+
+def record_chunk() -> bytes:
+    """Record AUDIO_CHUNK_S seconds of 16-bit mono PCM, return as WAV bytes."""
+    audio = sd.rec(
+        int(AUDIO_CHUNK_S * AUDIO_SAMPLE_RATE),
+        samplerate=AUDIO_SAMPLE_RATE,
+        channels=1,
+        dtype="int16",
+    )
+    sd.wait()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(AUDIO_SAMPLE_RATE)
+        wf.writeframes(audio.tobytes())
+    return buf.getvalue()
+
+
+def transcribe_chunk(wav_bytes: bytes) -> str:
+    """POST a WAV chunk to the Whisper server running on the Mac."""
+    try:
+        resp = requests.post(
+            f"{WHISPER_URL}/transcribe",
+            data=wav_bytes,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("text", "").strip()
+    except requests.RequestException as e:
+        log.warning("whisper server error: %s", e)
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -203,25 +249,17 @@ async def timelapse_loop(sess: Session) -> None:
 
 
 async def transcript_loop(sess: Session) -> None:
+    """Record audio in chunks, send to Mac's Whisper server, log results."""
     loop = asyncio.get_event_loop()
-    q: asyncio.Queue[str] = asyncio.Queue()
-
-    def _run_asr():
-        with asr.transcribe_stream(duration=0) as stream:
-            for event in stream:
-                if event.type == "full_text" and event.data.strip():
-                    loop.call_soon_threadsafe(q.put_nowait, event.data.strip())
-
-    asyncio.ensure_future(loop.run_in_executor(None, _run_asr))
-
     while True:
-        text = await q.get()
-        sess.transcript.append(text)
-        sess.log_event("narration", text)
-        webui.send_message("transcript", {
-            "text": text,
-            "time": datetime.now().strftime("%H:%M:%S"),
-        })
+        text = await loop.run_in_executor(None, lambda: transcribe_chunk(record_chunk()))
+        if text:
+            sess.transcript.append(text)
+            sess.log_event("narration", text)
+            webui.send_message("transcript", {
+                "text": text,
+                "time": datetime.now().strftime("%H:%M:%S"),
+            })
 
 
 async def mcu_event_loop(sess: Session) -> None:
@@ -235,7 +273,6 @@ async def mcu_event_loop(sess: Session) -> None:
 
 
 async def web_frame_loop() -> None:
-    """Push camera frames to the dashboard at a comfortable preview rate."""
     while True:
         await asyncio.sleep(WEB_FRAME_INTERVAL_S)
         frame = capture_frame()
@@ -248,7 +285,6 @@ async def web_frame_loop() -> None:
 
 
 async def status_broadcast_loop() -> None:
-    """Push session status to the dashboard periodically."""
     while True:
         await asyncio.sleep(1)
         if session is not None:
@@ -317,7 +353,6 @@ async def start_session():
 
     session = Session()
     detector = FrameChangeDetector()
-    asr.start()
     log.info("session started — session_dir=%s", session.session_dir)
     bridge.call("set_status", {"state": "watching"})
 
@@ -338,7 +373,6 @@ async def end_session():
     for t in session_tasks:
         t.cancel()
     session_tasks = []
-    asr.stop()
 
     bridge.call("set_status", {"state": "thinking"})
     webui.send_message("status", {"state": "thinking", "duration": 0, "events": 0})

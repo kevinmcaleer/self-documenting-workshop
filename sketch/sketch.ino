@@ -19,7 +19,7 @@
 
 #include <Arduino.h>
 #include <Arduino_LED_Matrix.h>
-#include <RPC.h>             // Bridge / RPC for App Lab
+#include <Arduino_RouterBridge.h>  // Bridge / RPC for App Lab
 
 // ---------- Pins ----------
 constexpr uint8_t PIN_BUTTON      = 2;   // momentary, INPUT_PULLUP
@@ -66,7 +66,7 @@ uint8_t pulsePhase = 0;
 
 // ---------- Forward decls ----------
 void rpc_set_status(int s);
-void rpc_pulse_led(const char* kind);
+void rpc_pulse_led(String kind);
 void renderFrame();
 void pollIronSensor();
 void pollButton();
@@ -82,10 +82,10 @@ void setup() {
 
   matrix.begin();
 
-  RPC.begin();
+  Bridge.begin();
   // Expose two functions the MPU can call.
-  RPC.bind("set_status", rpc_set_status);
-  RPC.bind("pulse_led", rpc_pulse_led);
+  Bridge.provide("set_status", rpc_set_status);
+  Bridge.provide("pulse_led", rpc_pulse_led);
 }
 
 // ---------- Loop ----------
@@ -123,9 +123,7 @@ void rpc_set_status(int s) {
 
 // Called by the Python agent when it logs an event of interest.
 // We flash to NOTICED briefly so it's visible on camera.
-void rpc_pulse_led(const char* kind) {
-  // We don't currently differentiate by kind, but the param is
-  // there so we can colour-code by event type later.
+void rpc_pulse_led(String kind) {
   (void)kind;
   if (currentStatus == STATUS_WATCHING || currentStatus == STATUS_NOTICED) {
     currentStatus = STATUS_NOTICED;
@@ -151,7 +149,7 @@ void pollIronSensor() {
     ironOn = nowOn;
     // Fire-and-forget notification to the MPU. Matches the
     // bridge.subscribe("mcu_events") loop in main.py.
-    RPC.call("mcu_events", ironOn ? "iron_on" : "iron_off");
+    Bridge.call("mcu_events", String(ironOn ? "iron_on" : "iron_off"));
   }
 }
 
@@ -177,12 +175,12 @@ void pollButton() {
   if (reading == LOW && !buttonHeld &&
       buttonDownMs && (now - buttonDownMs) >= LONG_PRESS_MS) {
     buttonHeld = true;
-    RPC.call("mcu_events", "session_end");
+    Bridge.call("mcu_events", String("session_end"));
   }
   if (reading == HIGH && buttonDownMs != 0) {
     if (!buttonHeld) {
       // Short press = mark moment.
-      RPC.call("mcu_events", "marker_pressed");
+      Bridge.call("mcu_events", String("marker_pressed"));
     }
     buttonDownMs = 0;
     buttonHeld = false;
