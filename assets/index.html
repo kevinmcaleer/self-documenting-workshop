@@ -4,13 +4,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Workshop Scribe</title>
-<script src="/socket.io/socket.io.js"></script>
+<!--
+  python-socketio (5.16) on the server pairs with socket.io-client v4. The
+  WebUI brick's fastapi-socketio mount only handles the protocol endpoint
+  at /socket.io, it doesn't serve the client JS bundle — that's why
+  /socket.io/socket.io.js used to 400. Load the matching client from the
+  official CDN. Version pinned for reproducibility.
+-->
+<script src="https://cdn.socket.io/4.8.1/socket.io.min.js"
+        integrity="sha384-mkQ3/7FUtcGyoppY6bz/PORYoGqOl7/aSUMn2ymDOJcapfS6PHqxhRTMh1RR0Q6+"
+        crossorigin="anonymous"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     background: #0f1117; color: #e4e4e7;
-    display: flex; flex-direction: column; min-height: 100vh;
+    display: flex; flex-direction: column;
+    /* Page is the scroll boundary — each card scrolls internally. */
+    height: 100vh; overflow: hidden;
   }
 
   header {
@@ -45,24 +57,60 @@
   .stats span { white-space: nowrap; }
 
   main {
-    display: grid; grid-template-columns: 1fr 1fr;
-    gap: 1rem; padding: 1rem 1.5rem; flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    /* minmax(0, 1fr) — the 0 lets the row shrink below its content size,
+       which is the trick that makes overflow:auto inside actually engage.
+       Without it, browsers default to min-height: auto = content height. */
+    grid-template-rows: minmax(0, 1fr) minmax(0, 25vh) 130px;
+    grid-template-areas:
+      "camera transcript"
+      "console console"
+      "sessions sessions";
+    gap: 1rem; padding: 1rem 1.5rem;
+    flex: 1; min-height: 0;
   }
-  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  @media (max-width: 800px) {
+    main {
+      grid-template-columns: 1fr;
+      grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 25vh) 130px;
+      grid-template-areas:
+        "camera"
+        "transcript"
+        "console"
+        "sessions";
+    }
+  }
+  .card-camera     { grid-area: camera; }
+  .card-transcript { grid-area: transcript; }
+  .card-console    { grid-area: console; }
+  .card-sessions   { grid-area: sessions; }
 
   .card {
     background: #1a1b23; border: 1px solid #2a2b35; border-radius: 10px;
     overflow: hidden; display: flex; flex-direction: column;
+    min-height: 0;  /* same trick at the flex level */
   }
   .card-header {
     padding: 0.75rem 1rem; border-bottom: 1px solid #2a2b35;
     font-size: 0.8rem; font-weight: 600; text-transform: uppercase;
     letter-spacing: 0.05em; color: #a1a1aa;
+    display: flex; align-items: center; justify-content: space-between;
+    flex-shrink: 0;
   }
-  .card-body { flex: 1; position: relative; }
+  .card-header button {
+    padding: 0.25rem 0.65rem; border: 1px solid #3a3b45;
+    background: #27272a; color: #d4d4d8; border-radius: 5px;
+    font-size: 0.7rem; font-weight: 600; cursor: pointer;
+    text-transform: uppercase; letter-spacing: 0.05em;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .card-header button:hover { background: #3a3b45; border-color: #52525b; }
+  .card-header button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .card-body { flex: 1 1 0; min-height: 0; position: relative; overflow: hidden; }
 
   #camera-feed {
-    width: 100%; display: block; background: #000;
+    width: 100%; height: 100%; display: block; background: #000;
     min-height: 240px; object-fit: contain;
   }
   .no-feed {
@@ -70,9 +118,56 @@
     justify-content: center; color: #52525b; font-size: 0.875rem;
   }
 
+  /* Mic level + threshold strip at the top of the Transcription card.
+     The bar fills proportional to current RMS (clamped at 3000); the
+     red "tick" marks the threshold so users can see at a glance which
+     side of the gate they're on. */
+  .mic-strip {
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid #2a2b35;
+    display: flex; align-items: center; gap: 0.6rem;
+    font-size: 0.7rem; color: #71717a;
+    flex-shrink: 0;
+  }
+  .mic-meter {
+    position: relative;
+    flex: 1; height: 8px;
+    background: #0f1117; border-radius: 4px; overflow: hidden;
+  }
+  .mic-meter-fill {
+    position: absolute; top: 0; left: 0; bottom: 0; width: 0;
+    background: linear-gradient(90deg, #14532d 0%, #4ade80 60%, #fbbf24 80%, #f87171 100%);
+    transition: width 0.08s linear;
+  }
+  .mic-meter-tick {
+    position: absolute; top: -2px; bottom: -2px;
+    width: 2px; background: #f87171;
+    transition: left 0.15s ease;
+  }
+  .mic-rms-label {
+    width: 3.5rem; text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: #a1a1aa;
+  }
+  .threshold-row {
+    padding: 0.4rem 1rem 0.5rem 1rem;
+    border-bottom: 1px solid #2a2b35;
+    display: flex; align-items: center; gap: 0.6rem;
+    font-size: 0.7rem; color: #71717a;
+    flex-shrink: 0;
+  }
+  .threshold-row input[type="range"] {
+    flex: 1; accent-color: #7dd3fc;
+  }
+  .threshold-row .value {
+    width: 3.5rem; text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: #d4d4d8;
+  }
+
   #transcript {
     padding: 1rem; font-size: 0.875rem; line-height: 1.6;
-    max-height: 60vh; overflow-y: auto;
+    height: 100%; overflow-y: auto;
   }
   #transcript:empty::before {
     content: "Transcription will appear here\2026";
@@ -81,11 +176,99 @@
   .line {
     padding: 0.25rem 0; border-bottom: 1px solid #1f2028;
     animation: fadein 0.3s ease;
+    display: flex; gap: 0.4rem; align-items: flex-start;
   }
   .line .ts {
-    color: #52525b; font-size: 0.75rem; margin-right: 0.5rem;
+    color: #52525b; font-size: 0.75rem;
     font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
   }
+  .line .text { flex: 1; }
+  .line .delete {
+    flex-shrink: 0;
+    background: transparent; border: none; color: #52525b;
+    cursor: pointer; font-size: 1rem; line-height: 1;
+    padding: 0 0.3rem; opacity: 0;
+    transition: opacity 0.15s, color 0.15s;
+  }
+  .line:hover .delete { opacity: 1; }
+  .line .delete:hover { color: #f87171; }
+
+  /* Visual cue when transcription is paused: dim the mic strip and the
+     transcript area so the user knows new lines aren't being captured. */
+  body.transcription-paused .mic-meter-fill { opacity: 0.4; }
+  body.transcription-paused #transcript     { opacity: 0.55; }
+
+  /* Debug console — monospace, level-coloured */
+  #console {
+    height: 100%; overflow-y: auto;
+    padding: 0.5rem 1rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.78rem; line-height: 1.45;
+  }
+  #console:empty::before {
+    content: "Debug console \2014 events appear here as the agent works\2026";
+    color: #52525b;
+  }
+  .log {
+    padding: 0.1rem 0; white-space: pre-wrap; word-break: break-word;
+    animation: fadein 0.2s ease;
+  }
+  .log .ts     { color: #52525b; margin-right: 0.5rem; }
+  .log .src    { color: #71717a; margin-right: 0.5rem; min-width: 5rem;
+                 display: inline-block; }
+  .log-info  .src { color: #7dd3fc; }   /* sky    — normal events     */
+  .log-info  .msg { color: #d4d4d8; }
+  .log-debug .src { color: #52525b; }   /* zinc   — verbose / muted   */
+  .log-debug .msg { color: #71717a; }
+  .log-warning .src,
+  .log-warning .msg { color: #fbbf24; } /* amber  — degraded but ok   */
+  .log-error .src,
+  .log-error .msg { color: #f87171; }   /* red    — needs attention   */
+
+  /* Sessions strip — horizontal scroll of completed-session cards */
+  .sessions-list {
+    height: 100%;
+    display: flex; gap: 0.6rem; align-items: stretch;
+    padding: 0.5rem 1rem; overflow-x: auto;
+  }
+  .sessions-empty {
+    display: flex; align-items: center; justify-content: center;
+    width: 100%; color: #52525b; font-size: 0.85rem;
+  }
+  .session-card {
+    flex: 0 0 auto; min-width: 220px; max-width: 280px;
+    background: #20212a; border: 1px solid #2a2b35; border-radius: 7px;
+    padding: 0.55rem 0.7rem;
+    display: flex; flex-direction: column; gap: 0.25rem;
+    font-size: 0.77rem;
+  }
+  .session-card.is-active {
+    border-color: #14532d;
+    background: linear-gradient(180deg, #0f3322 0%, #20212a 60%);
+  }
+  .session-name {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #e4e4e7; font-size: 0.82rem;
+  }
+  .session-meta { color: #71717a; }
+  .session-meta .deliverable { color: #7dd3fc; font-weight: 600; }
+  .session-meta .deliverable.none { color: #71717a; font-weight: 400; font-style: italic; }
+  .session-actions { display: flex; gap: 0.4rem; margin-top: auto; padding-top: 0.4rem; }
+  .btn-download, .btn-delete {
+    padding: 0.25rem 0.6rem; border-radius: 5px;
+    font-size: 0.7rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.05em;
+    cursor: pointer; border: 1px solid transparent;
+    text-decoration: none; display: inline-flex; align-items: center;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .btn-download { background: #1e3a5f; color: #7dd3fc; }
+  .btn-download:hover { background: #2c4a73; border-color: #3a5a83; }
+  .btn-delete   { background: #3b1a1a; color: #f87171; }
+  .btn-delete:hover   { background: #5a2424; border-color: #7a3030; }
+  .btn-download:disabled,
+  .btn-delete:disabled { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
   @keyframes fadein {
     from { opacity: 0; transform: translateY(4px); }
     to   { opacity: 1; transform: translateY(0); }
@@ -113,18 +296,59 @@
 </header>
 
 <main>
-  <div class="card">
-    <div class="card-header">Camera</div>
+  <div class="card card-camera">
+    <div class="card-header">
+      <span>Camera</span>
+      <span><button id="btn-rotate" onclick="rotateCamera()" title="Rotate 90° clockwise">Rotate</button></span>
+    </div>
     <div class="card-body">
       <div id="no-feed" class="no-feed">Waiting for camera&hellip;</div>
       <img id="camera-feed" style="display:none" />
     </div>
   </div>
 
-  <div class="card">
-    <div class="card-header">Transcription</div>
+  <div class="card card-transcript">
+    <div class="card-header">
+      <span>Transcription</span>
+      <span><button id="btn-transcription-toggle" onclick="toggleTranscription()">Pause</button></span>
+    </div>
+    <div class="mic-strip">
+      <span>Mic</span>
+      <div class="mic-meter">
+        <div id="mic-meter-fill" class="mic-meter-fill"></div>
+        <div id="mic-meter-tick" class="mic-meter-tick" style="left:8%"></div>
+      </div>
+      <span id="mic-rms" class="mic-rms-label">—</span>
+    </div>
+    <div class="threshold-row">
+      <span>Noise gate</span>
+      <input id="threshold-slider" type="range" min="0" max="2000" step="10" value="250" />
+      <span id="threshold-value" class="value">250</span>
+    </div>
     <div class="card-body">
       <div id="transcript"></div>
+    </div>
+  </div>
+
+  <div class="card card-console">
+    <div class="card-header">
+      <span>Debug Console</span>
+      <span>
+        <button id="btn-snapshot" onclick="snapshot()">Snapshot now</button>
+        <button id="btn-clear-console" onclick="clearConsole()">Clear</button>
+      </span>
+    </div>
+    <div class="card-body">
+      <div id="console"></div>
+    </div>
+  </div>
+
+  <div class="card card-sessions">
+    <div class="card-header">
+      <span>Sessions</span>
+    </div>
+    <div class="card-body">
+      <div id="sessions" class="sessions-list"></div>
     </div>
   </div>
 </main>
@@ -135,7 +359,9 @@
 const pill   = document.getElementById('pill');
 const btnOn  = document.getElementById('btn-start');
 const btnOff = document.getElementById('btn-stop');
+const btnSnap = document.getElementById('btn-snapshot');
 const txDiv  = document.getElementById('transcript');
+const conDiv = document.getElementById('console');
 const camImg = document.getElementById('camera-feed');
 const noFeed = document.getElementById('no-feed');
 const statDuration = document.getElementById('stat-duration');
@@ -145,20 +371,68 @@ let active = false;
 
 const socket = io();
 
-socket.on('connect', () => console.log('socket connected'));
+socket.on('connect',    () => console.log('socket connected'));
+socket.on('disconnect', () => console.log('socket disconnected'));
 
-// Live transcript lines from the server.
+// Auto-scroll only if the user is already pinned to the bottom — leaves
+// the scroll alone if they've scrolled up to read history.
+function nearBottom(el) {
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) < 12;
+}
+
+// Live transcript lines from the server. Each line carries a server-side
+// id so the delete button can roundtrip through DELETE /api/transcript/{id}
+// — which removes it from the session log Opus will see, not just from
+// the visible UI.
 socket.on('transcript', (data) => {
+  if (data.id && document.querySelector(`.line[data-id="${data.id}"]`)) {
+    return;  // duplicate (replay on reconnect): already shown
+  }
+  const stick = nearBottom(txDiv);
+
   const line = document.createElement('div');
   line.className = 'line';
+  if (data.id) line.dataset.id = data.id;
+
   const ts = document.createElement('span');
   ts.className = 'ts';
   ts.textContent = data.time || new Date().toLocaleTimeString();
+
+  const text = document.createElement('span');
+  text.className = 'text';
+  text.textContent = data.text;
+
+  const del = document.createElement('button');
+  del.className = 'delete';
+  del.title = 'Delete this line';
+  del.textContent = '×';  // ×
+  del.onclick = () => deleteNarration(data.id);
+
   line.appendChild(ts);
-  line.appendChild(document.createTextNode(data.text));
+  line.appendChild(text);
+  line.appendChild(del);
   txDiv.appendChild(line);
-  txDiv.scrollTop = txDiv.scrollHeight;
+  if (stick) txDiv.scrollTop = txDiv.scrollHeight;
 });
+
+// Server-broadcast: another client (or this one) deleted a line. Remove
+// the matching DOM node so all open dashboards stay in sync.
+socket.on('transcript_deleted', (data) => {
+  if (!data || !data.id) return;
+  const node = document.querySelector(`.line[data-id="${data.id}"]`);
+  if (node) node.remove();
+});
+
+async function deleteNarration(id) {
+  if (!id) return;
+  try {
+    await fetch('/api/transcript/' + encodeURIComponent(id), { method: 'DELETE' });
+    // The server emits transcript_deleted which we listen for above; no
+    // need to remove the DOM node here as well.
+  } catch (e) {
+    console.warn('delete failed', e);
+  }
+}
 
 // Camera frames as base64 JPEG, pushed from the server.
 socket.on('frame', (data) => {
@@ -171,6 +445,260 @@ socket.on('frame', (data) => {
 socket.on('status', (data) => {
   setStatus(data.state, data.duration, data.events);
 });
+
+// Debug console — server emits one entry per noteworthy event, plus a
+// replay of the last 200 entries on (re)connect via on_client_connect.
+socket.on('console', (data) => {
+  const stick = nearBottom(conDiv);
+  const line = document.createElement('div');
+  line.className = 'log log-' + (data.level || 'info');
+  const ts = document.createElement('span');
+  ts.className = 'ts';
+  ts.textContent = data.time || '';
+  const src = document.createElement('span');
+  src.className = 'src';
+  src.textContent = (data.source || '?').padEnd(10).slice(0, 10);
+  const msg = document.createElement('span');
+  msg.className = 'msg';
+  msg.textContent = data.text || '';
+  line.appendChild(ts);
+  line.appendChild(src);
+  line.appendChild(msg);
+  conDiv.appendChild(line);
+  // Keep DOM bounded — match server-side ring buffer size.
+  while (conDiv.childElementCount > 200) {
+    conDiv.removeChild(conDiv.firstChild);
+  }
+  if (stick) conDiv.scrollTop = conDiv.scrollHeight;
+});
+
+function clearConsole() {
+  conDiv.innerHTML = '';
+}
+
+async function snapshot() {
+  btnSnap.disabled = true;
+  try {
+    await fetch('/api/debug/snapshot', { method: 'POST' });
+  } finally {
+    // Re-enable after the response — Sonnet calls take ~1-2s typically.
+    setTimeout(() => { btnSnap.disabled = false; }, 500);
+  }
+}
+
+// Sessions library --------------------------------------------------------
+
+const sessDiv = document.getElementById('sessions');
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function formatStarted(iso) {
+  // Compact local-time label: "May 7  14:11"
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const month = d.toLocaleString(undefined, { month: 'short' });
+  const day   = d.getDate();
+  const hh    = String(d.getHours()).padStart(2, '0');
+  const mm    = String(d.getMinutes()).padStart(2, '0');
+  return `${month} ${day}  ${hh}:${mm}`;
+}
+
+async function refreshSessions() {
+  let list;
+  try {
+    const r = await fetch('/api/sessions');
+    list = await r.json();
+  } catch (e) {
+    sessDiv.innerHTML = '<div class="sessions-empty">Failed to load sessions</div>';
+    return;
+  }
+  sessDiv.innerHTML = '';
+  if (!list || list.length === 0) {
+    sessDiv.innerHTML =
+      '<div class="sessions-empty">No saved sessions yet — hit Start Session to record one.</div>';
+    return;
+  }
+  for (const s of list) {
+    const card = document.createElement('div');
+    card.className = 'session-card' + (s.is_active ? ' is-active' : '');
+
+    const name = document.createElement('div');
+    name.className = 'session-name';
+    name.textContent = formatStarted(s.started_at);
+
+    const meta = document.createElement('div');
+    meta.className = 'session-meta';
+    const delivKind = s.deliverable
+      ? `<span class="deliverable">${s.deliverable}</span>`
+      : (s.is_active
+          ? '<span class="deliverable none">recording…</span>'
+          : '<span class="deliverable none">no deliverable</span>');
+    meta.innerHTML = `${delivKind} · ${s.file_count} files · ${formatSize(s.size_bytes)}`;
+
+    const actions = document.createElement('div');
+    actions.className = 'session-actions';
+
+    const dl = document.createElement('a');
+    dl.className = 'btn-download';
+    dl.href = '/api/sessions/' + encodeURIComponent(s.name) + '/download';
+    dl.setAttribute('download', s.name + '.zip');
+    dl.textContent = 'Download';
+
+    const del = document.createElement('button');
+    del.className = 'btn-delete';
+    del.textContent = 'Delete';
+    del.onclick = () => deleteSession(s.name);
+    if (s.is_active) {
+      del.disabled = true;
+      del.title = "Can't delete an active session";
+    }
+
+    actions.appendChild(dl);
+    actions.appendChild(del);
+
+    card.appendChild(name);
+    card.appendChild(meta);
+    card.appendChild(actions);
+    sessDiv.appendChild(card);
+  }
+}
+
+async function deleteSession(name) {
+  if (!confirm(
+        'Delete session ' + name + '?\n\n'
+      + 'This removes all frames and the deliverable. Cannot be undone.'
+    )) return;
+  const r = await fetch('/api/sessions/' + encodeURIComponent(name), { method: 'DELETE' });
+  if (r.ok) {
+    refreshSessions();
+  } else {
+    const body = await r.json().catch(() => ({}));
+    alert('Delete failed: ' + (body.detail || r.statusText));
+  }
+}
+
+socket.on('sessions_changed', () => refreshSessions());
+
+refreshSessions();
+
+// Settings: camera rotation + RMS threshold ------------------------------
+
+const btnRotate     = document.getElementById('btn-rotate');
+const btnTransToggle = document.getElementById('btn-transcription-toggle');
+const micFill       = document.getElementById('mic-meter-fill');
+const micTick       = document.getElementById('mic-meter-tick');
+const micRmsLabel   = document.getElementById('mic-rms');
+const thresholdSlider = document.getElementById('threshold-slider');
+const thresholdValue  = document.getElementById('threshold-value');
+
+// Bar maxes out at this RMS — anything louder is "loud enough" anyway.
+// Real speech sits in the 1000-3000 range; the bar saturates there.
+const MIC_METER_MAX = 3000;
+
+let currentRotation = 0;
+let transcriptionEnabled = true;
+
+function setRotationLabel(deg) {
+  currentRotation = deg;
+  btnRotate.textContent = 'Rotate ' + deg + '°';
+}
+
+function setThresholdTick(t) {
+  const pct = Math.max(0, Math.min(100, (t / MIC_METER_MAX) * 100));
+  micTick.style.left = pct + '%';
+}
+
+function setTranscriptionEnabled(enabled) {
+  transcriptionEnabled = !!enabled;
+  btnTransToggle.textContent = transcriptionEnabled ? 'Pause' : 'Resume';
+  document.body.classList.toggle('transcription-paused', !transcriptionEnabled);
+}
+
+async function loadSettings() {
+  try {
+    const r = await fetch('/api/settings');
+    const s = await r.json();
+    setRotationLabel(s.rotation || 0);
+    thresholdSlider.value = s.rms_threshold;
+    thresholdValue.textContent = Math.round(s.rms_threshold);
+    setThresholdTick(s.rms_threshold);
+    setTranscriptionEnabled(s.transcription_enabled !== false);
+  } catch (e) {
+    console.warn('failed to load settings', e);
+  }
+}
+loadSettings();
+
+async function toggleTranscription() {
+  const next = !transcriptionEnabled;
+  btnTransToggle.disabled = true;
+  try {
+    const r = await fetch('/api/audio/transcription', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    });
+    if (r.ok) {
+      const d = await r.json();
+      setTranscriptionEnabled(d.enabled);
+    }
+  } finally {
+    btnTransToggle.disabled = false;
+  }
+}
+
+async function rotateCamera() {
+  // Cycle 0 → 90 → 180 → 270 → 0 ...
+  const next = (currentRotation + 90) % 360;
+  btnRotate.disabled = true;
+  try {
+    const r = await fetch('/api/camera/rotation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rotation: next }),
+    });
+    if (r.ok) {
+      const d = await r.json();
+      setRotationLabel(d.rotation);
+    }
+  } finally {
+    btnRotate.disabled = false;
+  }
+}
+
+// Live mic level meter — updated ~10 Hz from the audio callback.
+socket.on('audio_level', (data) => {
+  const rms = data.rms || 0;
+  const pct = Math.min(100, (rms / MIC_METER_MAX) * 100);
+  micFill.style.width = pct + '%';
+  micRmsLabel.textContent = Math.round(rms);
+});
+
+// Threshold slider — debounce so we don't POST on every drag pixel.
+let thresholdTimer = null;
+thresholdSlider.addEventListener('input', () => {
+  const v = +thresholdSlider.value;
+  thresholdValue.textContent = v;
+  setThresholdTick(v);
+  if (thresholdTimer) clearTimeout(thresholdTimer);
+  thresholdTimer = setTimeout(() => commitThreshold(v), 250);
+});
+
+async function commitThreshold(v) {
+  try {
+    await fetch('/api/audio/threshold', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threshold: v }),
+    });
+  } catch (e) {
+    console.warn('failed to commit threshold', e);
+  }
+}
 
 function setStatus(state, duration, events) {
   pill.className = 'pill pill-' + state;

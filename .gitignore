@@ -1,1 +1,17 @@
 .DS_Store
+
+# App Lab build cache — venv, generated compose, sketch artefacts.
+.cache/
+
+# Per-session output (timelapse frames, deliverables) lands here.
+sessions/
+
+# Local secrets — ANTHROPIC_API_KEY etc. Loaded by main.py at startup
+# from /app/.secrets.env (the project dir is bind-mounted into the
+# container at /app). Never commit this file.
+.secrets.env
+
+# Per-bench user preferences set from the dashboard (camera rotation,
+# RMS noise threshold). Lives at the project root because that's the
+# bind-mount path the container can write to.
+.scribe-config.json
